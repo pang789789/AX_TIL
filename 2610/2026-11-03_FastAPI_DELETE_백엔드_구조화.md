@@ -1,0 +1,458 @@
+# 2026-11-03 TIL — FastAPI DELETE API와 Backend 계층 구조화
+
+## 오늘 학습한 내용
+
+오늘은 오전에 CRUD의 마지막 기능인 회원 삭제 API를 구현하고, 오후에는 한 파일에 섞여 있던 FastAPI 코드를 Router, Service, Repository, Schema, DB 계층으로 분리했다.
+
+오전 실습에서는 삭제 API가 단순히 `204`를 반환하는 코드가 아니라 실제 PostgreSQL 데이터가 사라졌는지까지 확인해야 완성된다는 점을 배웠다. 오후 실습에서는 파일을 많이 만드는 것이 구조화의 목적이 아니라, HTTP 처리와 업무 규칙, SQL, 데이터 계약, DB 설정의 책임을 구분하는 것이 목적이라는 점을 이해했다.
+
+오늘 전체 흐름은 다음과 같았다.
+
+```text
+Chapter 09
+DELETE /members/{id}
+→ DELETE ... RETURNING
+→ commit
+→ 204 / 404 구분
+→ DB와 Swagger 결과 확인
+
+Chapter 10
+Router
+→ Service
+→ Repository
+→ PostgreSQL
+
+Schema = Request/Response 데이터 계약
+DB = 연결과 환경설정
+```
+
+---
+
+## Chapter 09. 회원 삭제 DELETE API
+
+### 1. DELETE API Contract
+
+이번 실습에서 정의한 삭제 API 계약은 다음과 같다.
+
+```text
+DELETE /members/{id}
+
+성공
+- 204 No Content
+- Response Body 없음
+
+실패
+- 회원이 없음: 404 Not Found
+- Path 값이 정수가 아님: 422 Unprocessable Entity
+- DB 연결 또는 SQL 실행 실패: 500 Internal Server Error
+```
+
+처음에는 삭제가 성공하면 `{"message": "deleted"}` 같은 응답을 보내는 것이 이해하기 쉬울 것 같았다. 하지만 이번 계약에서는 `204 No Content`를 사용하므로 응답 Body가 없어야 한다는 것을 배웠다.
+
+### 2. DELETE Endpoint 구현
+
+공통 DB 연결 함수는 `phase02/common/db.py`에 두고, Chapter09의 `main.py`에서는 이를 import했다.
+
+```python
+from fastapi import FastAPI, Response, HTTPException, status
+from common.db import get_connection
+
+
+app = FastAPI()
+
+
+@app.delete(
+    "/members/{id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_member(id: int):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM members
+                WHERE id = %s
+                RETURNING id
+                """,
+                (id,),
+            )
+
+            deleted = cur.fetchone()
+
+            if deleted is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Member not found",
+                )
+
+            conn.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+```
+
+값을 SQL 문자열에 직접 합치지 않고 `%s`와 tuple을 사용해 parameterized query로 전달했다.
+
+### 3. `DELETE ... RETURNING`을 사용한 이유
+
+`RETURNING id`를 사용하면 실제로 삭제된 행이 있었는지 바로 확인할 수 있다.
+
+```text
+cur.fetchone()에 값이 있음
+→ 삭제 대상이 존재했음
+→ commit 후 204
+
+cur.fetchone()이 None
+→ 삭제 대상이 없음
+→ 404
+```
+
+별도의 SELECT를 먼저 실행한 뒤 DELETE를 실행하지 않아도 존재 여부와 삭제 결과를 확인할 수 있다는 점이 편리했다.
+
+### 4. 삭제 성공을 확인하는 Evidence
+
+삭제 기능은 Swagger에서 `204`가 나오는 것만으로 끝내지 않는다.
+
+```text
+Swagger DELETE 결과 → 204
+PostgreSQL SELECT    → 0 rows
+GET 재조회           → 404
+```
+
+세 결과가 일치해야 실제 삭제가 완료됐다고 판단할 수 있다. HTTP 응답은 성공인데 commit이 누락되어 DB 데이터가 남아 있을 수도 있으므로 API와 DB를 함께 확인해야 한다.
+
+---
+
+## DELETE 실습에서 어려웠던 부분과 해결 과정
+
+### 1. 교수님은 404인데 내 화면에는 500이 나온 문제
+
+Swagger에서 존재하지 않는 회원을 DELETE했을 때 교수님 화면은 다음과 같았다.
+
+```json
+{
+  "detail": "Member not found"
+}
+```
+
+상태 코드는 `404`였다. 하지만 내 화면에서는 `500 Internal Server Error`가 발생했다. 처음에는 DELETE SQL이나 404 처리 코드가 잘못된 줄 알았지만, Uvicorn 로그를 확인하니 실제 오류는 다음과 같았다.
+
+```text
+psycopg.OperationalError
+fe_sendauth: no password supplied
+```
+
+즉 DELETE 로직까지 도달하기 전에 PostgreSQL 연결이 실패한 것이었다.
+
+### 2. `common/db.py` 이동 후 `.env` 경로가 잘못된 문제
+
+기존 `db.py`를 `phase02/common/db.py`로 옮겼지만 `.env`를 찾는 경로는 이전 상태로 남아 있었다.
+
+```python
+# 잘못된 설정
+PHASE02_DIR = Path(__file__).resolve().parent
+load_dotenv(PHASE02_DIR / ".env")
+```
+
+이 코드는 `phase02/common/.env`를 찾는다. 실제 `.env`는 `phase02/.env`에 있었기 때문에 DB 비밀번호를 읽지 못했다.
+
+다음과 같이 상위 폴더를 가리키도록 수정했다.
+
+```python
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(ENV_PATH, override=True)
+```
+
+수정 후 DB 연결을 확인했다.
+
+```text
+('postgres', 'public')
+```
+
+그리고 존재하지 않는 999번 회원을 삭제하여 정상적으로 404가 반환되는 것을 확인했다.
+
+```text
+DELETE /members/999
+→ HTTP 404
+→ {"detail":"Member not found"}
+```
+
+이번 오류를 통해 500이 나오면 API 코드만 보지 말고 Uvicorn traceback의 가장 마지막 원인부터 확인해야 한다는 것을 배웠다.
+
+### 3. 교수님 교안의 `member_id`와 내 DB의 `id`가 달랐던 문제
+
+교안 일부 SQL에는 기본키가 `member_id`로 작성되어 있었지만 내 `members` 테이블의 실제 컬럼 이름은 `id`였다.
+
+```sql
+-- 교안 예시
+WHERE member_id = %s
+
+-- 실제 DB에 맞춘 코드
+WHERE id = %s
+```
+
+예제 코드를 그대로 복사하기 전에 DBeaver에서 실제 테이블의 Columns를 확인해야 한다. 코드와 DB Schema가 다르면 `UndefinedColumn` 오류가 발생할 수 있다.
+
+### 4. VS Code의 파일 저장 충돌
+
+외부에서 파일을 수정한 뒤 VS Code에 이전 빈 파일이 열린 상태로 저장을 시도하자 다음 경고가 나타났다.
+
+```text
+Failed to save 'main.py': The content of the file is newer.
+```
+
+여기에서 `Overwrite`를 누르면 디스크의 최신 코드가 오래된 빈 내용으로 덮어써질 수 있었다. 빈 탭을 닫고 `Don't Save`를 선택한 뒤 파일을 다시 열어 해결했다.
+
+이 경험으로 외부 도구와 VS Code가 같은 파일을 동시에 수정할 때는 무조건 덮어쓰지 않고 어느 쪽이 최신인지 먼저 확인해야 한다는 것을 배웠다.
+
+---
+
+## Chapter 10. Backend 구조화와 계층 설계
+
+### 1. 구조화가 필요한 이유
+
+Chapter06~09에서는 Endpoint 안에 HTTP 처리, 업무 규칙, SQL, DB 연결 코드가 함께 있었다. 기능이 많아질수록 다음 문제가 생길 수 있다.
+
+- `main.py`가 너무 길어진다.
+- HTTP 코드와 SQL이 섞인다.
+- 이메일 중복 검사 같은 규칙이 반복된다.
+- 오류가 발생한 계층을 찾기 어려워진다.
+- 수정 영향 범위를 판단하기 어려워진다.
+
+이번 수업에서는 기능을 바꾸지 않고 책임을 다음처럼 분리했다.
+
+```text
+Router     → HTTP 요청과 응답
+Service    → 업무 규칙과 처리 순서
+Repository → SQL과 DB 접근
+Schema     → Request/Response 데이터 계약
+DB         → 연결과 환경설정
+```
+
+### 2. 만든 폴더 구조
+
+```text
+chapter10/
+├─ app/
+│  ├─ __init__.py
+│  ├─ main.py
+│  ├─ db.py
+│  ├─ schemas.py
+│  ├─ repositories/
+│  │  ├─ __init__.py
+│  │  └─ member_repository.py
+│  ├─ services/
+│  │  ├─ __init__.py
+│  │  └─ member_service.py
+│  └─ routers/
+│     ├─ __init__.py
+│     └─ members.py
+├─ .gitignore
+└─ README.md
+```
+
+실제 DB 설정은 공통 `phase02/.env`를 사용하도록 했다.
+
+### 3. DB 계층
+
+`app/db.py`는 환경변수를 읽고 PostgreSQL Connection을 생성하는 역할만 담당한다.
+
+```python
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(ENV_PATH, override=True)
+
+
+def get_connection():
+    return psycopg.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT", "5432"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+    )
+```
+
+Router나 Service에서 환경변수와 연결 정보를 반복하지 않게 되었다.
+
+### 4. Schema 계층
+
+`schemas.py`에 요청과 응답의 데이터 형식을 모았다.
+
+- `MemberCreate`: 회원 생성 요청
+- `MemberUpdate`: 전체 수정 요청
+- `MemberPatch`: 부분 수정 요청
+- `MemberResponse`: 회원 응답
+
+Pydantic의 `Field`와 `EmailStr`를 사용하여 이름 길이, 이메일 형식, 나이 범위를 검증했다.
+
+```python
+class MemberResponse(BaseModel):
+    id: int
+    name: str
+    email: EmailStr
+    age: int
+```
+
+### 5. Repository 계층
+
+Repository에는 PostgreSQL 접근과 SQL만 두었다.
+
+```text
+find_all()          → 전체 회원 조회
+find_by_id()        → 특정 회원 조회
+exists_by_email()   → 이메일 중복 확인
+create()            → 회원 등록
+```
+
+Repository는 데이터가 없더라도 `HTTPException`을 발생시키지 않고 `None`이나 조회 결과를 반환한다. HTTP 상태 코드를 모르는 계층으로 유지하는 것이 중요했다.
+
+이메일 중복 확인에서는 전체 회원 정보를 가져올 필요가 없으므로 다음 SQL을 사용했다.
+
+```sql
+SELECT 1
+FROM members
+WHERE email = %s;
+```
+
+DBeaver에서 이메일이 존재하면 결과로 `1`이 조회되는 것을 확인했다.
+
+### 6. Service 계층
+
+Service는 Repository 결과를 이용하여 업무 규칙을 판단한다.
+
+```python
+def get_member(member_id: int):
+    member = member_repository.find_by_id(member_id)
+
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    return member
+```
+
+회원 생성에서는 Repository를 다음 순서로 호출한다.
+
+```text
+이메일 중복 확인
+→ 중복이면 409
+→ 중복이 아니면 create()
+```
+
+SQL은 Service에 없고, 어떤 검사를 먼저 수행할지를 Service가 결정하도록 분리했다.
+
+### 7. Router 계층
+
+Router는 URL, HTTP Method, Request/Response Schema, Status Code를 담당하고 실제 처리는 Service에 전달한다.
+
+```python
+router = APIRouter(prefix="/members", tags=["members"])
+
+
+@router.get("", response_model=list[MemberResponse])
+def get_members():
+    return member_service.get_members()
+
+
+@router.get("/{id}", response_model=MemberResponse)
+def get_member(id: int):
+    return member_service.get_member(id)
+```
+
+Router에 SQL이 하나도 없어서 코드가 짧고 역할이 명확해졌다.
+
+### 8. `main.py`는 조립만 담당
+
+`app/main.py`에서는 FastAPI 애플리케이션을 만들고 Router를 등록했다.
+
+```python
+from fastapi import FastAPI
+from app.routers import members
+
+
+app = FastAPI()
+
+app.include_router(members.router)
+```
+
+`main.py`가 모든 기능을 직접 처리하지 않고 구성 요소를 조립하는 역할만 담당하게 되었다.
+
+---
+
+## Chapter 10 Swagger 검증
+
+Chapter10 서버는 기존 Chapter09와 구분하기 위해 8080 포트에서 실행했다.
+
+```powershell
+python -m uvicorn app.main:app --reload --port 8080
+```
+
+Swagger 주소:
+
+```text
+http://127.0.0.1:8080/docs
+```
+
+등록된 API:
+
+```text
+GET  /members
+GET  /members/{id}
+POST /members
+```
+
+`GET /members`를 실행한 결과:
+
+```text
+HTTP 200
+회원 5명 반환
+```
+
+응답 예시:
+
+```json
+[
+  {
+    "id": 1,
+    "name": "Kim",
+    "email": "kim@example.com",
+    "age": 25
+  }
+]
+```
+
+코드를 여러 파일로 나눈 뒤에도 기존 조회 동작이 유지되는 것을 확인했다. 이것이 구조화 이후 Regression Test가 필요한 이유라고 이해했다.
+
+## 오늘 느낀 점
+
+오전 DELETE 실습에서 가장 크게 느낀 점은 상태 코드만 보고 원인을 단정하면 안 된다는 것이다. 교수님과 같은 요청을 보냈는데 나는 500이 나왔다. DELETE 코드가 틀렸다고 생각했지만 실제 원인은 `.env` 경로였다. Uvicorn 로그를 끝까지 확인하지 않았다면 SQL 코드만 계속 수정했을 것 같다.
+
+오후 구조화 수업에서는 파일을 여러 개 만드는 것이 처음에는 오히려 복잡해 보였다. 하지만 각 파일의 질문을 하나씩 정해 보니 이해하기 쉬웠다.
+
+```text
+Router: 어떤 URL과 HTTP Method인가?
+Service: 어떤 규칙과 순서로 처리하는가?
+Repository: 어떤 SQL을 실행하는가?
+Schema: 어떤 데이터를 주고받는가?
+DB: 어떻게 PostgreSQL에 연결하는가?
+```
+
+이 기준이 있으면 오류가 발생했을 때 확인할 위치도 좁힐 수 있다. 404와 409 판단은 Service, SQL 오류는 Repository, 입력 형식 문제는 Schema, 경로와 상태 코드는 Router, 연결 오류는 DB 설정에서 확인하면 된다.
+
+또한 구조화는 기능 추가가 아니라 리팩터링이므로 Swagger 결과가 이전과 같아야 한다는 점이 중요했다. 내부 파일이 잘 나뉘었더라도 기존 API Contract가 바뀌거나 조회가 실패하면 성공한 구조화가 아니다.
+
+오늘은 여러 번 화면과 폴더 위치가 달라 혼동했지만, 실제 경로와 import 방향을 하나씩 확인하면서 최종적으로 다음 의존성 방향을 맞출 수 있었다.
+
+```text
+Router → Service → Repository → DB
+```
+
+## 다음 학습에서 보완할 점
+
+- Swagger에서 `GET /members/{id}`의 200과 404를 각각 확인하기
+- POST 정상 등록 시 201이 반환되는지 확인하기
+- 중복 이메일 POST가 409를 반환하고 DB row가 증가하지 않는지 확인하기
+- 기존 PUT, PATCH, DELETE도 각 계층으로 분리하기
+- Repository에 `HTTPException`이 남아 있지 않은지 점검하기
+- Router와 Service에 SQL이 남아 있지 않은지 점검하기
+- 구조화 전후 API Contract를 비교하는 Regression Test 목록 만들기
+
+오늘 실습을 통해 CRUD를 구현하는 방법뿐 아니라, 코드가 커졌을 때 책임을 어떻게 나누고 오류를 어느 계층에서 찾아야 하는지까지 한 단계 더 구체적으로 이해할 수 있었다.
